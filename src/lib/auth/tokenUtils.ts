@@ -5,9 +5,13 @@ import { refreshTokenApi, getUserProfile } from '$lib/api/auth';
 import { jwtDecode } from 'jwt-decode';
 import type { USER_ROLE_ENUM } from '$lib/types/auth';
 
-// Token expiration times (in seconds)
-export const ACCESS_TOKEN_EXPIRY = 15 * 60; // 15 minutes
-export const REFRESH_TOKEN_EXPIRY = 7 * 24 * 60 * 60; // 7 days
+// Constants
+export const ACCESS_TOKEN_EXPIRY = 15 * 60; // 15 minutes in seconds
+export const REFRESH_TOKEN_EXPIRY = 7 * 24 * 60 * 60; // 7 days in seconds
+
+// Cookie names
+const ACCESS_TOKEN_COOKIE = 'accessToken';
+const REFRESH_TOKEN_COOKIE = 'refreshToken';
 
 // Cookie options
 const secureCookie = import.meta.env.PROD;
@@ -55,16 +59,11 @@ export function setCookie(name: string, value: string, expirySeconds: number): v
 export function getCookie(name: string): string | null {
   if (!browser) return null;
   
-  const nameEQ = `${name}=`;
-  const ca = document.cookie.split(';');
-  
-  for (let i = 0; i < ca.length; i++) {
-    let c = ca[i].trim();
-    if (c.indexOf(nameEQ) === 0) {
-      return c.substring(nameEQ.length, c.length);
-    }
+  const value = `; ${document.cookie}`;
+  const parts = value.split(`; ${name}=`);
+  if (parts.length === 2) {
+    return parts.pop()?.split(';').shift() || null;
   }
-  
   return null;
 }
 
@@ -80,11 +79,11 @@ export function deleteCookie(name: string): void {
  * Save access token to cookie and update user info
  */
 export function saveAccessToken(accessToken: string, userId: string = '', email: string = ''): void {
+  // Save access token to cookie
+  setCookie(ACCESS_TOKEN_COOKIE, accessToken, ACCESS_TOKEN_EXPIRY);
+  
   // Decode token to get roles
   const { username, roles } = decodeToken(accessToken);
-  
-  // Save access token to cookie
-  setCookie('accessToken', accessToken, ACCESS_TOKEN_EXPIRY);
   
   // Update auth store with user info
   authStore.setUser({
@@ -99,7 +98,7 @@ export function saveAccessToken(accessToken: string, userId: string = '', email:
  * Save refresh token to cookie
  */
 export function saveRefreshToken(refreshToken: string): void {
-  setCookie('refreshToken', refreshToken, REFRESH_TOKEN_EXPIRY);
+  setCookie(REFRESH_TOKEN_COOKIE, refreshToken, REFRESH_TOKEN_EXPIRY);
 }
 
 /**
@@ -118,14 +117,77 @@ export function clearTokens(): void {
   authStore.clearAuth();
   
   // Clear from cookies
-  deleteCookie('accessToken');
-  deleteCookie('refreshToken');
+  deleteCookie(ACCESS_TOKEN_COOKIE);
+  deleteCookie(REFRESH_TOKEN_COOKIE);
 }
 
 // Track refresh token promise to avoid multiple parallel calls
 let refreshTokenPromise: Promise<RefreshTokenResponse> | null = null;
 // Track whether we're in a refresh token flow
 let isRefreshing = false;
+
+/**
+ * Load user info from API and update store
+ */
+async function loadUserInfo(): Promise<void> {
+  try {
+    const userProfile = await getUserProfile();
+    if (userProfile) {
+      authStore.setUser(userProfile);
+    }
+  } catch (error) {
+    console.error('Failed to load user profile:', error);
+    // If we can't get user profile, try to get basic info from token
+    const accessToken = getCookie(ACCESS_TOKEN_COOKIE);
+    if (accessToken) {
+      const { username, roles } = decodeToken(accessToken);
+      authStore.setUser({
+        userId: '',
+        username,
+        email: '',
+        roles
+      });
+    }
+  }
+}
+
+/**
+ * Check if we need to refresh the token on app startup
+ * Returns a promise that resolves when token check is complete
+ */
+export async function checkAndRefreshTokenOnStartup(): Promise<void> {
+  if (!browser) return;
+  
+  // Set initial loading state
+  authStore.setLoading(true);
+  
+  try {
+    // Check if we have an access token
+    const accessToken = getCookie(ACCESS_TOKEN_COOKIE);
+    const refreshToken = getCookie(REFRESH_TOKEN_COOKIE);
+    
+    if (accessToken && refreshToken) {
+      // Try to load user info first
+      await loadUserInfo();
+      
+      // Then try to refresh token
+      try {
+        await refreshTokens();
+      } catch (error) {
+        console.error('Failed to refresh token on startup:', error);
+        clearTokens();
+      }
+    } else {
+      clearTokens();
+    }
+  } catch (error) {
+    console.error('Error during startup:', error);
+    clearTokens();
+  } finally {
+    // Finished loading
+    authStore.setLoading(false);
+  }
+}
 
 /**
  * Refresh tokens using the refresh token API
@@ -141,7 +203,7 @@ export async function refreshTokens(): Promise<RefreshTokenResponse> {
   
   try {
     // Get refresh token from cookie
-    const refreshToken = getCookie('refreshToken');
+    const refreshToken = getCookie(REFRESH_TOKEN_COOKIE);
     
     if (!refreshToken) {
       throw new Error('No refresh token available');
@@ -157,13 +219,8 @@ export async function refreshTokens(): Promise<RefreshTokenResponse> {
     saveAccessToken(response.accessToken);
     saveRefreshToken(response.refreshToken);
 
-    // Fetch user profile to get complete user info
-    try {
-      const userProfile = await getUserProfile();
-      authStore.setUser(userProfile);
-    } catch (error) {
-      console.error('Failed to fetch user profile:', error);
-    }
+    // Load full user info
+    await loadUserInfo();
     
     return response;
   } catch (error) {
@@ -177,29 +234,51 @@ export async function refreshTokens(): Promise<RefreshTokenResponse> {
   }
 }
 
-/**
- * Check if we need to refresh the token on app startup
- * Returns a promise that resolves when token check is complete
- */
-export async function checkAndRefreshTokenOnStartup(): Promise<void> {
-  if (!browser) return;
-  
-  // Check if we have a refresh token in cookies
-  const refreshToken = getCookie('refreshToken');
-  
-  // Set initial loading state
-  authStore.setLoading(true);
-  
-  if (refreshToken) {
-    try {
-      // Try to refresh token to get a new access token
-      await refreshTokens();
-    } catch (error) {
-      console.error('Failed to refresh token on startup:', error);
-      clearTokens();
+// Function to handle login
+export async function handleLogin(username: string, password: string) {
+  try {
+    const response = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ username, password })
+    });
+
+    if (!response.ok) {
+      throw new Error('Login failed');
     }
+
+    const { accessToken, refreshToken, userId, email } = await response.json();
+
+    // Save tokens and user info
+    saveAccessToken(accessToken, userId, email);
+    saveRefreshToken(refreshToken);
+
+    return { success: true };
+  } catch (error) {
+    console.error('Login failed:', error);
+    return { success: false, error };
   }
-  
-  // Finished loading
-  authStore.setLoading(false);
+}
+
+// Function to handle logout
+export function handleLogout() {
+  // Clear cookies
+  deleteCookie(ACCESS_TOKEN_COOKIE);
+  deleteCookie(REFRESH_TOKEN_COOKIE);
+
+  // Clear auth store
+  authStore.clearAuth();
+}
+
+// Function to get the current access token
+export function getAccessToken(): string | null {
+  return getCookie(ACCESS_TOKEN_COOKIE);
+}
+
+// Function to check if user is authenticated
+export function isAuthenticated(): boolean {
+  if (!browser) return false;
+  return !!getCookie(ACCESS_TOKEN_COOKIE);
 }

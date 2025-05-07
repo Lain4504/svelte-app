@@ -1,7 +1,8 @@
 import axios, { AxiosError, type AxiosInstance, type InternalAxiosRequestConfig, type AxiosResponse } from 'axios';
 import { get } from 'svelte/store';
 import { authStore } from '$lib/stores/authStore';
-import { refreshTokens, clearTokens } from '$lib/auth/tokenUtils';
+import { refreshTokens, clearTokens, getAccessToken } from '$lib/auth/tokenUtils';
+import { browser } from '$app/environment';
 
 // API configuration
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000/api';
@@ -41,7 +42,7 @@ const isGraphQLAuthError = (response: AxiosResponse): boolean => {
   const errors = response.data?.errors || [];
   return errors.some((error: any) => 
     error.extensions?.code === 'UNAUTHENTICATED' || 
-    error.message?.includes('not authenticated')
+    error.message?.toLowerCase().includes('not authenticated')
   );
 };
 
@@ -49,10 +50,11 @@ const isGraphQLAuthError = (response: AxiosResponse): boolean => {
  * Add auth token to request headers if available
  */
 const addAuthHeader = (config: InternalAxiosRequestConfig): InternalAxiosRequestConfig => {
-  const authState = get(authStore);
+  if (!browser) return config;
   
-  if (authState.accessToken) {
-    config.headers.Authorization = `Bearer ${authState.accessToken}`;
+  const token = getAccessToken();
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
   }
   
   return config;
@@ -66,10 +68,19 @@ const handleResponseError = async (
   client: AxiosInstance,
   isGraphQL = false
 ): Promise<any> => {
+  if (!browser) return Promise.reject(error);
+  
+  console.log('Handling response error:', error);
   const originalRequest: any = error.config;
+  
+  if (!originalRequest) {
+    console.error('No original request config found in error object');
+    return Promise.reject(error);
+  }
   
   // Skip if already retried too many times
   if (originalRequest._retry >= MAX_RETRY_ATTEMPTS) {
+    console.log('Max retry attempts reached');
     return Promise.reject(error);
   }
   
@@ -79,28 +90,42 @@ const handleResponseError = async (
   }
   
   // Check for authentication errors
-  const isAuthError = 
-    (error.response?.status === 401) || 
-    (isGraphQL && isGraphQLAuthError(error.response as AxiosResponse));
+  let isAuthError = error.response?.status === 401;
+  
+  // For GraphQL, also check error message in response data
+  if (isGraphQL && error.response) {
+    isAuthError = isAuthError || isGraphQLAuthError(error.response as AxiosResponse);
+  }
+  
+  console.log('Is auth error:', isAuthError);
   
   if (isAuthError) {
     try {
+      console.log('Attempting to refresh token...');
       // Increment retry counter
       originalRequest._retry += 1;
       
       // Add exponential backoff for retries
       await sleep(RETRY_DELAY * originalRequest._retry);
       
-      // Refresh token
-      await refreshTokens();
+      // Refresh token - wait for the operation to complete
+      const refreshResult = await refreshTokens();
+      console.log('Token refresh successful:', refreshResult.accessToken.substring(0, 10) + '...');
       
       // Update authentication header with new token
-      const authState = get(authStore);
-      originalRequest.headers.Authorization = `Bearer ${authState.accessToken}`;
+      const token = getAccessToken();
+      if (token) {
+        originalRequest.headers = originalRequest.headers || {};
+        originalRequest.headers.Authorization = `Bearer ${token}`;
+      } else {
+        throw new Error('Failed to get new access token after refresh');
+      }
       
+      console.log('Retrying original request with new token...');
       // Retry the original request
       return client(originalRequest);
     } catch (refreshError) {
+      console.error('Token refresh failed:', refreshError);
       // If refresh token fails, clear auth and reject
       clearTokens();
       return Promise.reject(refreshError);
@@ -124,8 +149,60 @@ apiClient.interceptors.response.use(
 
 // Add response interceptors for GraphQL client
 graphqlClient.interceptors.response.use(
-  response => response,
-  error => handleResponseError(error, graphqlClient, true)
+  response => {
+    // Check for GraphQL errors in the response data
+    if (response.data?.errors) {
+      const error = response.data.errors[0];
+      console.log('GraphQL Error detected in response:', error);
+      
+      if (error.extensions?.code === 'UNAUTHENTICATED' || 
+          error.message?.toLowerCase().includes('not authenticated')) {
+        console.log('Detected authentication error in GraphQL response, triggering refresh...');
+        
+        // Create a proper Axios error
+        const axiosError = new axios.AxiosError(
+          error.message,
+          '401',
+          response.config,
+          null,
+          {
+            message: error.message,
+            code: '401',
+            config: response.config,
+            response: {
+              status: 401,
+              statusText: 'Unauthorized',
+              data: response.data,
+              headers: response.headers,
+              config: response.config
+            }
+          }
+        );
+        
+        // Set the response on the AxiosError
+        axiosError.response = {
+          status: 401,
+          statusText: 'Unauthorized',
+          data: response.data,
+          headers: response.headers,
+          config: response.config
+        } as any;
+        
+        // Make sure handleResponseError is called with the proper parameters
+        return handleResponseError(axiosError, graphqlClient, true)
+          .catch(err => {
+            console.error('GraphQL auth error handling failed:', err);
+            throw axiosError; // Return the original error if refresh attempt fails
+          });
+      }
+    }
+    
+    return response;
+  },
+  error => {
+    console.log('GraphQL Error Interceptor received error:', error);
+    return handleResponseError(error, graphqlClient, true);
+  }
 );
 
 /**
@@ -135,17 +212,26 @@ export async function graphqlQuery<T>(
   query: string, 
   variables: Record<string, any> = {}
 ): Promise<T> {
-  const response = await graphqlClient.post('', {
-    query,
-    variables
-  });
-  
-  // Check for GraphQL errors in the response
-  if (response.data.errors) {
-    throw new Error(response.data.errors[0].message);
+  try {
+    console.log(`Executing GraphQL query with ${Object.keys(variables).length} variables`);
+    
+    const response = await graphqlClient.post('', {
+      query,
+      variables
+    });
+    
+    // Check for GraphQL errors in the response
+    if (response.data.errors) {
+      const errorMessage = response.data.errors[0].message;
+      console.error('GraphQL error in response:', errorMessage);
+      throw new Error(errorMessage);
+    }
+    
+    return response.data.data as T;
+  } catch (error) {
+    console.error('GraphQL query failed:', error);
+    throw error;
   }
-  
-  return response.data.data as T;
 }
 
 /**

@@ -22,11 +22,32 @@ export async function loginApi(email: string, password: string): Promise<LoginRe
  * Refresh token API function
  */
 export async function refreshTokenApi(refreshToken: string): Promise<RefreshTokenResponse> {
-  const response = await axios.post<RefreshTokenResponse>(`${API_BASE_URL}/auth/refresh-token`, {
-    refreshToken
-  });
-  
-  return response.data;
+  try {
+    console.log('Refreshing token with:', refreshToken.substring(0, 10) + '...');
+    
+    // Use the direct axios instance to avoid circular dependency with apiClient
+    // This prevents the refresh token request from being intercepted by the refresh logic
+    const response = await axios.post<RefreshTokenResponse>(
+      `${API_BASE_URL}/auth/refresh-token`, 
+      { refreshToken },
+      {
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    if (!response.data || !response.data.accessToken) {
+      console.error('Invalid refresh token response:', response.data);
+      throw new Error('Invalid refresh token response');
+    }
+    
+    console.log('Token refresh successful');
+    return response.data;
+  } catch (error) {
+    console.error('Token refresh failed:', error);
+    throw error;
+  }
 }
 
 /**
@@ -58,5 +79,12 @@ export async function getUserProfile(): Promise<User> {
  * Logout function
  */
 export async function logoutApi(): Promise<void> {
-  await apiClient.post('/auth/logout');
+  try {
+    // Call backend logout API
+    await axios.post(`${API_BASE_URL}/auth/logout`);
+  } catch (error) {
+    console.error('Logout API error:', error);
+    // Even if API fails, we still want to clear local tokens
+    throw error;
+  }
 }

@@ -3,6 +3,7 @@
   import { loginApi } from '$lib/api/auth';
   import { authStore } from '$lib/stores/authStore';
   import { saveAccessToken, saveRefreshToken } from '$lib/auth/tokenUtils';
+  import { onMount } from 'svelte';
   
   let email = '';
   let password = '';
@@ -15,6 +16,13 @@
     const urlParams = new URLSearchParams(window.location.search);
     returnUrl = urlParams.get('returnUrl') || '/dashboard';
   }
+  
+  // Check authentication on mount
+  onMount(() => {
+    if ($authStore.isAuthenticated) {
+      goto(returnUrl);
+    }
+  });
   
   async function handleLogin() {
     if (!email || !password) {

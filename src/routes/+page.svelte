@@ -3,7 +3,9 @@
   import { goto } from '$app/navigation';
   
   function goToLogin() {
-    goto('/login');
+    if (!$authStore.isAuthenticated) {
+      goto('/login');
+    }
   }
   
   function goToDashboard() {
