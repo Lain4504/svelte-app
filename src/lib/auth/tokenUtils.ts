@@ -4,14 +4,16 @@ import type { RefreshTokenResponse } from '$lib/types/auth';
 import { refreshTokenApi, getUserProfile } from '$lib/api/auth';
 import { jwtDecode } from 'jwt-decode';
 import type { USER_ROLE_ENUM } from '$lib/types/auth';
+import { TokenRefreshManager, TokenRefreshError } from './TokenRefreshManager';
+import { AdaptiveRefreshManager } from './AdaptiveRefreshManager';
 
 // Constants
-export const ACCESS_TOKEN_EXPIRY = 3 * 60; // 15 minutes in seconds
+export const ACCESS_TOKEN_EXPIRY = 3 * 60; // 3 minutes in seconds
 export const REFRESH_TOKEN_EXPIRY = 7 * 24 * 60 * 60; // 7 days in seconds
 
 // Cookie names
-const ACCESS_TOKEN_COOKIE = 'accessToken';
-const REFRESH_TOKEN_COOKIE = 'refreshToken';
+export const ACCESS_TOKEN_COOKIE = 'accessToken';
+export const REFRESH_TOKEN_COOKIE = 'refreshToken';
 
 // Cookie options
 const secureCookie = import.meta.env.PROD;
@@ -23,6 +25,21 @@ interface DecodedToken {
   sub: string;
   iat: number;
   exp: number;
+}
+
+/**
+ * Check if token is valid and not about to expire
+ */
+export function isTokenValid(token: string): boolean {
+  try {
+    const decoded = jwtDecode<DecodedToken>(token);
+    const now = Math.floor(Date.now() / 1000);
+    
+    // Check if token is expired or will expire in next 30 seconds
+    return decoded.exp > now + 30;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -119,12 +136,10 @@ export function clearTokens(): void {
   // Clear from cookies
   deleteCookie(ACCESS_TOKEN_COOKIE);
   deleteCookie(REFRESH_TOKEN_COOKIE);
+  
+  // Reset adaptive refresh manager
+  AdaptiveRefreshManager.getInstance().reset();
 }
-
-// Track refresh token promise to avoid multiple parallel calls
-let refreshTokenPromise: Promise<RefreshTokenResponse> | null = null;
-// Track whether we're in a refresh token flow
-let isRefreshing = false;
 
 /**
  * Load user info from API and update store
@@ -153,7 +168,6 @@ async function loadUserInfo(): Promise<void> {
 
 /**
  * Check if we need to refresh the token on app startup
- * Returns a promise that resolves when token check is complete
  */
 export async function checkAndRefreshTokenOnStartup(): Promise<void> {
   if (!browser) return;
@@ -170,12 +184,14 @@ export async function checkAndRefreshTokenOnStartup(): Promise<void> {
       // Try to load user info first
       await loadUserInfo();
       
-      // Then try to refresh token
-      try {
-        await refreshTokens();
-      } catch (error) {
-        console.error('Failed to refresh token on startup:', error);
-        clearTokens();
+      // Then try to refresh token if needed
+      if (!isTokenValid(accessToken)) {
+        try {
+          await refreshTokens();
+        } catch (error) {
+          console.error('Failed to refresh token on startup:', error);
+          clearTokens();
+        }
       }
     } else {
       clearTokens();
@@ -191,47 +207,34 @@ export async function checkAndRefreshTokenOnStartup(): Promise<void> {
 
 /**
  * Refresh tokens using the refresh token API
- * Returns a promise with the new tokens
  */
 export async function refreshTokens(): Promise<RefreshTokenResponse> {
-  // If already refreshing, return the existing promise
-  if (isRefreshing && refreshTokenPromise) {
-    return refreshTokenPromise;
-  }
-  
-  isRefreshing = true;
+  const refreshManager = TokenRefreshManager.getInstance();
+  const adaptiveManager = AdaptiveRefreshManager.getInstance();
   
   try {
-    // Get refresh token from cookie
-    const refreshToken = getCookie(REFRESH_TOKEN_COOKIE);
-    
-    if (!refreshToken) {
-      throw new Error('No refresh token available');
-    }
-    
-    // Create a new promise for the refresh token call
-    refreshTokenPromise = refreshTokenApi(refreshToken);
-    
-    // Wait for the response
-    const response = await refreshTokenPromise;
-    
-    // Save the new tokens
-    saveAccessToken(response.accessToken);
-    saveRefreshToken(response.refreshToken);
-
-    // Load full user info
-    await loadUserInfo();
-    
+    const response = await refreshManager.refresh();
+    adaptiveManager.onRefreshSuccess();
     return response;
   } catch (error) {
-    // If refresh fails, clear tokens and throw error
-    clearTokens();
+    adaptiveManager.onRefreshFailure();
     throw error;
-  } finally {
-    // Reset the promise and flag
-    refreshTokenPromise = null;
-    isRefreshing = false;
   }
+}
+
+/**
+ * Get access token from cookie
+ */
+export function getAccessToken(): string | null {
+  return getCookie(ACCESS_TOKEN_COOKIE);
+}
+
+/**
+ * Check if user is authenticated
+ */
+export function isAuthenticated(): boolean {
+  const token = getAccessToken();
+  return !!token && isTokenValid(token);
 }
 
 // Function to handle login
@@ -270,15 +273,4 @@ export function handleLogout() {
 
   // Clear auth store
   authStore.clearAuth();
-}
-
-// Function to get the current access token
-export function getAccessToken(): string | null {
-  return getCookie(ACCESS_TOKEN_COOKIE);
-}
-
-// Function to check if user is authenticated
-export function isAuthenticated(): boolean {
-  if (!browser) return false;
-  return !!getCookie(ACCESS_TOKEN_COOKIE);
 }

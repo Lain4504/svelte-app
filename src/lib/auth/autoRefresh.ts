@@ -1,12 +1,10 @@
 import { browser } from '$app/environment';
 import { authStore } from '$lib/stores/authStore';
-import { refreshTokens, ACCESS_TOKEN_EXPIRY } from './tokenUtils';
+import { refreshTokens } from './tokenUtils';
 import { get } from 'svelte/store';
+import { AdaptiveRefreshManager } from './AdaptiveRefreshManager';
 
 let refreshInterval: ReturnType<typeof setInterval> | null = null;
-
-// Calculate refresh time (80% of token expiry)
-const REFRESH_TIME = (ACCESS_TOKEN_EXPIRY * 0.8) * 1000;
 
 /**
  * Start automatic token refresh
@@ -17,16 +15,31 @@ export function startAutoRefresh(): void {
   // Clear any existing interval
   stopAutoRefresh();
   
-  // Set up new interval
-  refreshInterval = setInterval(async () => {
-    if (get(authStore).isAuthenticated) {
-      try {
-        await refreshTokens();
-      } catch (error) {
-        console.error('Auto refresh token failed:', error);
-      }
+  const adaptiveManager = AdaptiveRefreshManager.getInstance();
+  
+  // Set up new interval with adaptive timing
+  const scheduleNextRefresh = () => {
+    if (refreshInterval) {
+      clearInterval(refreshInterval);
     }
-  }, REFRESH_TIME);
+    
+    refreshInterval = setInterval(async () => {
+      if (get(authStore).isAuthenticated) {
+        try {
+          await refreshTokens();
+          // Schedule next refresh with adaptive timing
+          scheduleNextRefresh();
+        } catch (error) {
+          console.error('Auto refresh token failed:', error);
+          // On failure, schedule next refresh sooner
+          scheduleNextRefresh();
+        }
+      }
+    }, adaptiveManager.getNextRefreshInterval());
+  };
+  
+  // Start the first refresh cycle
+  scheduleNextRefresh();
 }
 
 /**

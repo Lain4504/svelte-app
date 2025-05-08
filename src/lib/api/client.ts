@@ -1,8 +1,9 @@
 import axios, { AxiosError, type AxiosInstance, type InternalAxiosRequestConfig, type AxiosResponse } from 'axios';
 import { get } from 'svelte/store';
 import { authStore } from '$lib/stores/authStore';
-import { refreshTokens, clearTokens, getAccessToken } from '$lib/auth/tokenUtils';
+import { refreshTokens, clearTokens, getAccessToken, isTokenValid } from '$lib/auth/tokenUtils';
 import { browser } from '$app/environment';
+import { TokenRefreshError } from '$lib/auth/TokenRefreshManager';
 
 // API configuration
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000/api';
@@ -61,6 +62,34 @@ const addAuthHeader = (config: InternalAxiosRequestConfig): InternalAxiosRequest
 };
 
 /**
+ * Retry a request with exponential backoff
+ */
+async function retryRequest<T>(
+  requestFn: () => Promise<T>,
+  maxRetries: number = MAX_RETRY_ATTEMPTS
+): Promise<T> {
+  let lastError: Error | null = null;
+  
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await requestFn();
+    } catch (error) {
+      lastError = error as Error;
+      
+      // Don't retry if it's not an auth error
+      if (!(error instanceof TokenRefreshError)) {
+        throw error;
+      }
+      
+      // Exponential backoff
+      await sleep(Math.pow(2, i) * RETRY_DELAY);
+    }
+  }
+  
+  throw lastError;
+}
+
+/**
  * Handle response error with token refresh and retry logic
  */
 const handleResponseError = async (
@@ -105,25 +134,21 @@ const handleResponseError = async (
       // Increment retry counter
       originalRequest._retry += 1;
       
-      // Add exponential backoff for retries
-      await sleep(RETRY_DELAY * originalRequest._retry);
-      
-      // Refresh token - wait for the operation to complete
-      const refreshResult = await refreshTokens();
-      console.log('Token refresh successful:', refreshResult.accessToken.substring(0, 10) + '...');
+      // Try to refresh token
+      await refreshTokens();
       
       // Update authentication header with new token
       const token = getAccessToken();
-      if (token) {
-        originalRequest.headers = originalRequest.headers || {};
-        originalRequest.headers.Authorization = `Bearer ${token}`;
-      } else {
-        throw new Error('Failed to get new access token after refresh');
+      if (!token || !isTokenValid(token)) {
+        throw new TokenRefreshError('Invalid token after refresh', 'REFRESH_FAILED');
       }
       
+      originalRequest.headers = originalRequest.headers || {};
+      originalRequest.headers.Authorization = `Bearer ${token}`;
+      
       console.log('Retrying original request with new token...');
-      // Retry the original request
-      return client(originalRequest);
+      // Retry the original request with exponential backoff
+      return retryRequest(() => client(originalRequest));
     } catch (refreshError) {
       console.error('Token refresh failed:', refreshError);
       // If refresh token fails, clear auth and reject
