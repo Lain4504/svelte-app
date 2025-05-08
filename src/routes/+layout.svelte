@@ -8,9 +8,10 @@
 	import { getUserProfile } from '$lib/api/auth';
 	import { authStore } from '$lib/stores/authStore';
 	import { browser } from '$app/environment';
+	import { startAutoRefresh, stopAutoRefresh } from '$lib/auth/autoRefresh';
 
 	// Set up automatic token refresh
-	let refreshTokenInterval: NodeJS.Timeout | null = null;
+	let refreshTokenInterval: ReturnType<typeof setInterval> | null = null;
 	
 	onMount(async () => {
 		if (browser) {
@@ -30,20 +31,8 @@
 					}
 				}
 				
-				// Set up automatic token refresh at regular intervals
-				// We'll refresh the token at 80% of its lifetime to ensure it doesn't expire
-				const refreshTime = (ACCESS_TOKEN_EXPIRY * 0.8) * 1000;
-				
-				refreshTokenInterval = setInterval(async () => {
-					const { isAuthenticated } = $authStore;
-					if (isAuthenticated) {
-						try {
-							await refreshTokens();
-						} catch (error) {
-							console.error('Auto refresh token failed:', error);
-						}
-					}
-				}, refreshTime);
+				// Start automatic token refresh
+				startAutoRefresh();
 			} catch (error) {
 				console.error('Error during app initialization:', error);
 			}
@@ -52,9 +41,7 @@
 	
 	onDestroy(() => {
 		// Clean up the interval when the component is destroyed
-		if (refreshTokenInterval) {
-			clearInterval(refreshTokenInterval);
-		}
+		stopAutoRefresh();
 	});
 </script>
 

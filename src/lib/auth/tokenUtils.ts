@@ -6,7 +6,7 @@ import { jwtDecode } from 'jwt-decode';
 import type { USER_ROLE_ENUM } from '$lib/types/auth';
 
 // Constants
-export const ACCESS_TOKEN_EXPIRY = 15 * 60; // 15 minutes in seconds
+export const ACCESS_TOKEN_EXPIRY = 3 * 60; // 15 minutes in seconds
 export const REFRESH_TOKEN_EXPIRY = 7 * 24 * 60 * 60; // 7 days in seconds
 
 // Cookie names
